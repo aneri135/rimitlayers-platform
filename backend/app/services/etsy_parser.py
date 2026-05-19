@@ -163,92 +163,94 @@ class EtsyParser:
     ) -> Optional[str]:
         """
         Extracts Etsy order number.
-        Etsy order IDs are numeric: e.g. 3456789012
 
-        WHY CHECK BOTH BODY AND SUBJECT?
-        Order number sometimes appears in subject ("Order #3456789012")
-        and always in body. We check subject first (faster),
-        then body as fallback.
+        The order number appears in subject inside [..., Order #XXXXXXXXXX]
+        and also in the email body.
         """
-        # Try subject first
+        # Try subject first — most reliable
+        # Matches: Order #4067696529 anywhere in subject
         patterns = [
-            r"order\s*#\s*(\d{8,12})",
-            r"#(\d{8,12})",
+            r"Order\s*#\s*(\d{8,12})",      # "Order #4067696529"
+            r"#(\d{8,12})\]",               # "#4067696529]" at end of subject
+            r"order number is:\s*(\d{8,12})", # "Your order number is: 4067696529"
+            r"order[:\s#]*(\d{8,12})",       # fallback
         ]
+
         for text in [subject, body]:
             for pattern in patterns:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     return f"etsy_{match.group(1)}"
-                    # Prefix with "etsy_" so order IDs are unique
-                    # across platforms (eBay might have same number)
 
-        # If no number found, create hash-based ID
-        # Not ideal but prevents losing the record entirely
+        # Hash-based fallback
         return f"etsy_email_{hashlib.md5(body[:100].encode()).hexdigest()[:8]}"
 
     def _extract_price(self, body: str) -> Optional[float]:
         """
-        Extracts sale price from email body.
-
-        REGEX EXPLAINED:
-        r"\$\s*([\d,]+\.?\d*)"
-        - \$ = literal dollar sign ($ has special meaning in regex so we escape it)
-        - \s* = zero or more spaces (handles "$ 54.99" and "$54.99")
-        - ([\d,]+\.?\d*) = capture group:
-          - [\d,]+ = one or more digits or commas (handles "1,234.99")
-          - \.? = optional decimal point
-          - \d* = zero or more digits after decimal
-
-        WHY findall NOT search?
-        findall returns ALL matches. Emails can have multiple prices
-        (item price, shipping, total). We take the first one which
-        is typically the item sale price.
+        REAL ETSY EMAIL PRICE FORMAT (from live testing):
+        "Price: $21.99"
+        "Item total: $21.99"
+        "Subtotal: $18.69"  (after discount — use original price not subtotal)
         """
         patterns = [
-            r"item price[:\s]*\$\s*([\d,]+\.?\d*)",
-            r"order total[:\s]*\$\s*([\d,]+\.?\d*)",
-            r"\$\s*([\d,]+\.?\d*)",
+            r"Price:\s*\$\s*([\d,]+\.?\d*)",        # "Price: $21.99"
+            r"Item total:\s*\$\s*([\d,]+\.?\d*)",    # "Item total: $21.99"
+            r"price[:\s]*\$\s*([\d,]+\.?\d*)",       # generic price
+            r"\$\s*([\d,]+\.?\d*)",                  # any dollar amount
         ]
         for pattern in patterns:
             match = re.search(pattern, body, re.IGNORECASE)
             if match:
-                price_str = match.group(1).replace(",", "")
-                # .replace(",", "") removes thousand separators
-                # "1,234.99" → "1234.99" → float 1234.99
                 try:
-                    return float(price_str)
+                    return float(match.group(1).replace(",", ""))
                 except ValueError:
                     continue
         return None
 
     def _extract_product_name(self, body: str) -> Optional[str]:
-        """Extracts the product/listing name from the email."""
-        patterns = [
-            r"item:\s*(.+?)(?:\n|quantity|qty|price)",
-            r"listing:\s*(.+?)(?:\n|$)",
-            r"you sold:\s*(.+?)(?:\n|$)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, body, re.IGNORECASE | re.DOTALL)
-            if match:
-                name = match.group(1).strip()
-                # Strip removes leading/trailing whitespace
-                if len(name) > 3:  # Ignore very short matches
-                    return name[:200]  # Limit to 200 chars
-        return None
+        """
+        REAL ETSY EMAIL PRODUCT FORMAT:
+        Product name appears as a clickable link in the email.
+        Usually the longest descriptive text near the top.
 
-    def _extract_buyer_name(self, body: str) -> Optional[str]:
-        """Extracts buyer name from order email."""
+        "Modern Spiral 3D Printed Decorative Vase - Sculptural Home Decor..."
+        """
         patterns = [
-            r"ship to[:\s]*([A-Z][a-z]+ [A-Z][a-z]+)",
-            r"buyer[:\s]*([A-Z][a-z]+ [A-Z][a-z]+)",
-            r"sold to[:\s]*([A-Z][a-z]+ [A-Z][a-z]+)",
+            # After "Quantity: N" line, product name is usually nearby
+            r"([A-Z][a-zA-Z0-9\s\-\|,]+(?:3D|Printed|Lithophane|Lantern|Vase)[a-zA-Z0-9\s\-\|,]+?)(?:\n|Shop:)",
+            # Common product name patterns for RiMitLayers products
+            r"((?:3D Printed|Custom|Modern|Spiral|Halloween|Christmas|Santa)[a-zA-Z0-9\s\-\|,\.]+?)(?:\n|Shop:|Transaction)",
+            # Generic: any long capitalised phrase
+            r"([A-Z][a-zA-Z0-9\s\-\|]{20,100})(?:\n|Shop:)",
         ]
         for pattern in patterns:
             match = re.search(pattern, body, re.IGNORECASE)
             if match:
-                return match.group(1).strip()
+                name = match.group(1).strip()
+                if len(name) > 10:
+                    return name[:300]
+        return None
+
+    def _extract_buyer_name(self, body: str) -> Optional[str]:
+        """
+        The buyer name is the FIRST line after "Shipping address"
+        """
+        patterns = [
+            # Match name after "Shipping address" label — real Etsy format
+            r"Shipping address\s*\n\s*([A-Z][a-zA-Z\s\-'\.]+?)(?:\n|$)",
+            # Match name after "Ship to:" label
+            r"[Ss]hip\s+to[:\s]*\n?\s*([A-Z][a-zA-Z\s\-'\.]+?)(?:\n|,|\d)",
+            # Match name in "sold to" context
+            r"[Ss]old\s+to[:\s]*\n?\s*([A-Z][a-zA-Z\s\-'\.]+?)(?:\n|,|\d)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, body, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Validate: name should be 2+ words, no digits
+                words = name.split()
+                if len(words) >= 2 and not any(c.isdigit() for c in name):
+                    return name[:100]
         return None
 
     def _extract_buyer_name_from_message(
@@ -271,38 +273,67 @@ class EtsyParser:
 
     def _extract_address(self, body: str) -> Dict:
         """
-        Extracts shipping address components.
-        Returns dict with city, state, country, zip, full address.
+
+        We extract each component separately.
         """
         address = {
             "full": "", "city": "", "state": "",
             "country": "", "zip": ""
         }
 
-        # Try to find address block — usually after "Ship to:"
-        addr_match = re.search(
-            r"ship\s+to[:\s]*(.+?)(?:order|item|from etsy|\Z)",
-            body,
-            re.IGNORECASE | re.DOTALL
-        )
-        if addr_match:
-            full_addr = addr_match.group(1).strip()
-            address["full"] = full_addr[:500]
+        # Find the shipping address block
+        # Etsy puts it after "Shipping address" header
+        addr_patterns = [
+            r"Shipping address\s*\n(.+?)(?:\n\n|\Z)",
+            r"Ship\s+to[:\s]*\n(.+?)(?:\n\n|\Z)",
+        ]
 
-            # Extract US zip code
-            zip_match = re.search(r"\b(\d{5}(?:-\d{4})?)\b", full_addr)
+        addr_block = ""
+        for pattern in addr_patterns:
+            match = re.search(pattern, body, re.IGNORECASE | re.DOTALL)
+            if match:
+                addr_block = match.group(1).strip()
+                break
+
+        if addr_block:
+            address["full"] = addr_block[:500]
+            lines = [l.strip() for l in addr_block.split("\n") if l.strip()]
+
+            # Last line is usually country
+            if lines:
+                last = lines[-1]
+                if any(country in last.upper() for country in [
+                    "UNITED STATES", "CANADA", "UK", "UNITED KINGDOM",
+                    "AUSTRALIA", "INDIA", "GERMANY", "FRANCE"
+                ]):
+                    address["country"] = last
+                elif last.upper() == "UNITED STATES" or re.match(r'^[A-Z\s]+$', last):
+                    address["country"] = last
+
+            # Extract US zip code (5 digit or ZIP+4)
+            zip_match = re.search(r"\b(\d{5}(?:-\d{4})?)\b", addr_block)
             if zip_match:
                 address["zip"] = zip_match.group(1)
 
-            # Extract state (2-letter US state abbreviation)
-            state_match = re.search(
-                r"\b([A-Z]{2})\b\s+\d{5}",
-                full_addr
+            # Extract state and city from "CITY, ST ZIPCODE" format
+            # e.g. "ELIZABETH, CO 80107-7869"
+            city_state = re.search(
+                r"([A-Z][A-Z\s]+),\s+([A-Z]{2})\s+\d{5}",
+                addr_block,
+                re.IGNORECASE
             )
-            if state_match:
-                address["state"] = state_match.group(1)
+            if city_state:
+                address["city"]  = city_state.group(1).strip().title()
+                address["state"] = city_state.group(2).strip().upper()
+
+        # If no block found, try extracting components individually
+        if not address["zip"]:
+            zip_match = re.search(r"\b(\d{5}(?:-\d{4})?)\b", body)
+            if zip_match:
+                address["zip"] = zip_match.group(1)
 
         return address
+
 
     def _extract_quantity(self, body: str) -> Optional[int]:
         """Extracts quantity ordered."""

@@ -30,26 +30,36 @@ from app.services.ebay_parser import EbayParser
 SAMPLE_ETSY_ORDER_EMAIL = {
     "id": "gmail_msg_001",
     "from": "transaction@etsy.com",
-    "subject": "You made a sale! Order #3456789012",
+    "subject": "You made a sale on Etsy - Ship by May 23 - [$26.31, Order #4067696529]",
     "date": datetime.now(),
     "body": """
-    Congratulations! You made a sale on Etsy.
+Congratulations on your Etsy sale of 1 item.
+Your order number is: 4067696529
 
-    Order #3456789012
+Order details
 
-    Item: Custom Color Lithophane LED Night Light
-    Qty: 1
-    Item price: $54.99
-    Shipping: $5.00
-    Order total: $59.99
+Payment method                    Shipping address
+Paid via Etsy Payments on         Leny Yoder
+May 19, 2026                      34319 Columbine Trl E
+                                  ELIZABETH, CO 80107-7869
+                                  United States
 
-    Ship to:
-    Deepanshu Mehta
-    123 Main Street
-    Mumbai, MH 400001
-    India
+Modern Spiral 3D Printed Decorative Vase - Sculptural Home Decor - Desk, Coffee Table, Shelf Centerpiece
+Shop: RiMitLayers
+Transaction ID: 5084173437
+Quantity: 1
+Price: $21.99
+Returns and exchanges accepted within 30 days of delivery
 
-    View your order at etsy.com/your/orders/3456789012
+Item total:     $21.99
+Discount:       -$3.30
+Subtotal:       $18.69
+Shipping:       $6.36
+Sales tax:      $0.98
+
+Order total:    $26.31
+
+etsy.com/your/orders/4067696529
     """
 }
 
@@ -207,9 +217,9 @@ def test_etsy_parser():
         passed = result["platform"] == "etsy"
         all_passed &= run_test("Platform = etsy", passed)
 
-        passed = result["sale_price"] == 54.99
+        passed = round(result["sale_price"], 2) == round(21.99, 2)
         all_passed &= run_test(
-            f"Sale price extracted = $54.99",
+            f"Sale price extracted = $21.99",
             passed,
             f"Got: ${result.get('sale_price')}"
         )

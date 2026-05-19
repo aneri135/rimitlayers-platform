@@ -25,8 +25,13 @@
 import sys
 import os
 import logging
+import pytz
 from datetime import datetime, timezone
 from typing import Optional
+# System start time — only process emails NEWER than this
+# Prevents old unread emails from triggering false alerts
+# on first run
+
 
 sys.path.append(
     os.path.join(os.path.dirname(__file__), '..', '..', '..')
@@ -43,6 +48,9 @@ from app.services.ebay_parser import EbayParser
 from app.notifications.notifier import notifier
 
 logger = logging.getLogger(__name__)
+
+SYSTEM_START_TIME = datetime.now(timezone.utc)
+logger.info(f"System start time set to: {SYSTEM_START_TIME}")
 
 # Track consecutive failures for self-healing alerts
 # Module-level variable persists between poll cycles
@@ -123,7 +131,21 @@ def run_poll_cycle() -> dict:
             # Safety limit — prevents overload if inbox is full
         )
 
-        logger.info(f"Found {len(emails)} unread emails to process")
+        emails = [
+            e for e in emails
+            if e.get("date") and (
+            # Handle both timezone-aware and naive datetimes
+            (hasattr(e["date"], "tzinfo") and e["date"].tzinfo and
+            e["date"] >= SYSTEM_START_TIME)
+            or
+            (hasattr(e["date"], "tzinfo") and not e["date"].tzinfo and
+            e["date"] >= SYSTEM_START_TIME.replace(tzinfo=None))
+        )
+    ]
+
+        logger.info(
+    f"After date filter: {len(emails)} emails from last 5 min window"
+)
 
         # Step 3: Process each email
         for email in emails:

@@ -146,88 +146,68 @@ class GmailService:
     def get_unread_emails(
         self,
         from_addresses: List[str] = None,
-        max_results: int = 50
+        max_results: int = 50,
+        since_minutes: int = 10  # look back 10 minutes to catch any missed
     ) -> List[Dict]:
         """
-        Fetches unread emails from Gmail inbox.
+        Fetches emails — both unread AND recently received.
 
-        WHY THIS SIGNATURE?
-        from_addresses lets the caller say "only get emails from
-        these senders" — we pass ["@etsy.com", "@mail.etsy.com"]
-        so we never even fetch irrelevant emails.
+        WHY LOOK AT READ EMAILS TOO?
+        If you manually read an Etsy email before the 5-min poll runs,
+        the order would never reach your database.
+        Solution: we search for emails received in the last 10 minutes
+        regardless of read status, then check our database to see if
+        we already recorded it (using the unique order_id constraint).
+        If it's already in the database — skip. If not — process it.
 
-        max_results=50 is a safety limit — prevents fetching
-        thousands of emails if something goes wrong.
+        This means:
+        - You read the email manually → still gets recorded in DB
+        - No Telegram alert sent for already-processed orders (DB check)
+        - Dashboard always has complete data
 
-        WHAT IS A Dict?
-        Dict is Python's type hint for dictionary.
-        List[Dict] means "a list of dictionaries" — each email
-        is returned as a Python dictionary with keys like
-        'id', 'from', 'subject', 'body', 'date'.
-
-        RETURN VALUE STRUCTURE:
-        [
-            {
-                'id': 'gmail_message_id',
-                'from': 'transaction@etsy.com',
-                'subject': 'You made a sale!',
-                'body': '...full email body...',
-                'date': datetime object,
-                'raw_headers': {...}
-            },
-            ...
-        ]
+        INTERVIEW POINT:
+        "I discovered that polling only unread emails caused a data gap
+        when the user manually read an email before the poll ran.
+        I fixed this by searching emails received in the last N minutes
+        regardless of read status, then using the database unique
+        constraint as the deduplication mechanism. If an order_id
+        already exists in the database, it's skipped silently."
         """
         if not self.service:
-            logger.error("Gmail service not initialised")
             return []
 
         try:
-            # Build Gmail search query
-            # Gmail API uses the same search syntax as Gmail's search bar
-            # "is:unread" = only unread emails
-            # "in:inbox" = only inbox (not spam/trash)
-            query_parts = ["is:unread", "in:inbox"]
+            query_parts = ["in:inbox"]
+            # Remove "is:unread" — we now check ALL recent emails
+            # Database unique constraint handles deduplication
 
-            # Add sender filter if provided
-            # Gmail search: "from:etsy.com OR from:mail.etsy.com"
+            # Add time filter — only emails from last 10 minutes
+            # Gmail search supports 'newer_than:Xm' syntax
+            query_parts.append(f"newer_than:{since_minutes}m")
+
             if from_addresses:
-                # Build OR condition for multiple senders
-                # e.g. "(from:etsy.com OR from:mail.etsy.com)"
                 from_query = " OR ".join(
                     [f"from:{addr}" for addr in from_addresses]
                 )
                 query_parts.append(f"({from_query})")
 
-            # Join all parts with space = AND in Gmail search
             query = " ".join(query_parts)
             logger.info(f"Gmail search query: {query}")
 
-            # Call Gmail API to list matching messages
-            # userId="me" means "the authenticated user" — always "me"
-            # We get a list of message IDs and thread IDs
             result = self.service.users().messages().list(
                 userId="me",
                 q=query,
                 maxResults=max_results
             ).execute()
 
-            # .execute() actually sends the HTTP request
-            # Everything before .execute() is just building the request
-
             messages = result.get("messages", [])
-            # .get("messages", []) safely returns [] if key missing
-            # Better than result["messages"] which crashes if missing
 
             if not messages:
-                logger.info("No new unread emails found")
+                logger.info("No recent emails found")
                 return []
 
-            logger.info(f"Found {len(messages)} unread emails to process")
+            logger.info(f"Found {len(messages)} recent emails to check")
 
-            # Step 2: Fetch full details for each message
-            # The list() call above only gives us IDs
-            # We need a second API call per email to get the content
             emails = []
             for msg in messages:
                 email_data = self._get_email_details(msg["id"])
@@ -237,17 +217,12 @@ class GmailService:
             return emails
 
         except HttpError as e:
-            # HttpError is Google's specific error type for API failures
-            # e.g. 401 = auth expired, 429 = rate limited, 503 = Google down
             logger.error(f"Gmail API error: {e.status_code} — {e.reason}")
             return []
         except Exception as e:
-            # Catch-all for unexpected errors
-            # We return [] not raise — polling must continue even if
-            # one check fails
             logger.error(f"Unexpected error fetching emails: {e}")
             return []
-
+    
     def _get_email_details(self, message_id: str) -> Optional[Dict]:
         """
         Fetches full content of a single email by its ID.
@@ -470,33 +445,18 @@ class GmailService:
 
     def mark_as_read(self, message_id: str) -> bool:
         """
-        Marks an email as read after we've processed it.
-
-        WHY MARK AS READ?
-        Our query fetches "is:unread" emails.
-        If we process an email but don't mark it read,
-        we'll process it AGAIN on the next poll — creating
-        duplicate records in your database.
-
-        Marking as read = "I've seen this, skip next time"
-
-        GMAIL LABEL SYSTEM:
-        Gmail uses labels not folders.
-        UNREAD is a label — removing it marks the email as read.
-        modifyMessage() can add or remove labels.
+        Marks email as read after processing.
+        Now optional — deduplication happens via database unique constraint.
+        Still useful to keep inbox clean.
         """
         try:
             self.service.users().messages().modify(
                 userId="me",
                 id=message_id,
-                body={
-                    "removeLabelIds": ["UNREAD"]
-                    # removeLabelIds removes the UNREAD label
-                    # which marks the email as read in Gmail
-                }
+                body={"removeLabelIds": ["UNREAD"]}
             ).execute()
-            logger.info(f"Marked email {message_id} as read")
             return True
         except Exception as e:
-            logger.error(f"Could not mark {message_id} as read: {e}")
+            # Non-critical — log but don't fail
+            logger.debug(f"Could not mark {message_id} as read: {e}")
             return False
