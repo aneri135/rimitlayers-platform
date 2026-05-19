@@ -45,8 +45,15 @@ logger = logging.getLogger(__name__)
 # gmail.readonly = read emails (for parsing Etsy/eBay notifications)
 # gmail.send = send emails (for alert emails to ourselves)
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+    # gmail.modify includes read + mark as read + move to labels
+    # It does NOT allow deleting emails or accessing Drive/Calendar
+    # More permissive than readonly but still very limited
+    # We need this to mark processed emails as read so we
+    # don't process the same email on every poll cycle
+
     "https://www.googleapis.com/auth/gmail.send",
+    # Required for sending email alerts to ourselves
 ]
 
 
@@ -360,43 +367,105 @@ class GmailService:
         return body  # Return empty string if nothing found
 
     def _parse_date(self, date_str: str) -> Optional[datetime]:
-        """
-        Converts Gmail date string to Python datetime object.
+        
+     # Converts Gmail date string to Python datetime object.
 
-        Email dates follow RFC 2822 format:
-        "Wed, 14 May 2026 10:30:00 +0000"
-        "Wed, 14 May 2026 10:30:00 -0500"
+    #PROBLEM WE SOLVED:
+    #Real-world email date strings are messy. They can have:
+    #- Double spaces: "Thu,  2 Apr 2026" (single digit day)
+    #- Extra timezone labels: "+0000 (UTC)" at the end
+    #- Missing day names: "2 Apr 2026 21:03:24 +0000"
+    #- Different timezone formats: "+0000" vs "UTC" vs "GMT"
 
-        We try multiple formats because different email servers
-        format dates slightly differently.
+    #SOLUTION: Clean the string first, then try multiple formats.
+    #Pre-processing handles the messiness before format matching.
 
-        WHY DATETIME OBJECTS INSTEAD OF STRINGS?
-        - Easy to compare (date1 > date2)
-        - Easy to filter (WHERE order_date > '2026-01-01')
-        - SQLAlchemy stores them as proper DATETIME in database
-        - Can extract year/month easily for tax reporting
-        """
+    #WHY NOT USE email.utils.parsedate()?
+    #Python's standard library has email.utils.parsedate() which
+   # handles RFC 2822 dates. We use it as our primary parser
+    #because it handles ALL these edge cases automatically.
+    #Our manual formats are a fallback only.
+
+
         if not date_str:
             return datetime.now(timezone.utc)
 
-        # Common date formats seen in real emails
+    # ---- APPROACH 1: Use Python's built-in email date parser ----
+    # email.utils.parsedate_to_datetime() implements RFC 2822
+    # the exact standard that email date headers follow
+    # This is the most robust approach
+        try:
+            from email.utils import parsedate_to_datetime
+            return parsedate_to_datetime(date_str.strip())
+        except Exception:
+            pass  # Fall through to manual parsing
+
+    # ---- APPROACH 2: Clean the string then try manual formats ----
+    # Some date strings have quirks that even parsedate can't handle
+    # We clean them up first
+
+        import re
+
+        cleaned = date_str.strip()
+
+    # Remove trailing timezone labels like "(UTC)", "(EST)", "(GMT+0)"
+    # These appear AFTER the numeric offset and confuse strptime
+    # Example: "+0000 (UTC)" → "+0000"
+        cleaned = re.sub(r'\s*\([^)]+\)\s*$', '', cleaned).strip()
+
+    # Normalise multiple spaces to single space
+    # Example: "Thu,  2 Apr" → "Thu, 2 Apr"
+    # This fixes single-digit days which some servers pad with space
+        cleaned = re.sub(r' +', ' ', cleaned)
+
+    # Try formats on the cleaned string
         formats = [
-            "%a, %d %b %Y %H:%M:%S %z",     # Wed, 14 May 2026 10:30:00 +0000
-            "%a, %d %b %Y %H:%M:%S %Z",     # Wed, 14 May 2026 10:30:00 UTC
-            "%d %b %Y %H:%M:%S %z",         # 14 May 2026 10:30:00 +0000
+            "%a, %d %b %Y %H:%M:%S %z",    # Thu, 02 Apr 2026 21:03:24 +0000
+            "%a, %d %b %Y %H:%M:%S %Z",    # Thu, 02 Apr 2026 21:03:24 UTC
+            "%d %b %Y %H:%M:%S %z",        # 02 Apr 2026 21:03:24 +0000
+            "%d %b %Y %H:%M:%S %Z",        # 02 Apr 2026 21:03:24 UTC
+            "%a, %d %b %Y %H:%M:%S",       # Thu, 02 Apr 2026 21:03:24 (no tz)
         ]
 
         for fmt in formats:
             try:
-                # strptime = "string parse time"
-                # Parses string using the format pattern
-                return datetime.strptime(date_str.strip(), fmt)
+                return datetime.strptime(cleaned, fmt)
             except ValueError:
-                # This format didn't match — try next one
                 continue
 
-        # If no format matched, log a warning and use current time
-        logger.warning(f"Could not parse date: {date_str}")
+    # ---- APPROACH 3: Extract date parts with regex ----
+    # Last resort — pull out the parts we care about manually
+    # Works even if the format is completely non-standard
+        try:
+            months = {
+                "jan": 1, "feb": 2, "mar": 3,  "apr": 4,
+                "may": 5, "jun": 6, "jul": 7,  "aug": 8,
+                "sep": 9, "oct": 10,"nov": 11, "dec": 12
+            }
+
+        # Match: optional "Day, " + day + month + year + time
+            match = re.search(
+                r'(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+'
+                r'(\d{2}):(\d{2}):(\d{2})',
+                date_str
+            )
+            if match:
+                day, mon, year, hour, minute, sec = match.groups()
+                month_num = months.get(mon.lower())
+                if month_num:
+                    return datetime(
+                        int(year), month_num, int(day),
+                        int(hour), int(minute), int(sec),
+                        tzinfo=timezone.utc
+                    )
+        except Exception:
+            pass
+
+    # Complete fallback — use current time and log a warning
+        logger.warning(
+            f"Could not parse date after all attempts: '{date_str}' "
+            f"— using current time as fallback"
+        )
         return datetime.now(timezone.utc)
 
     def mark_as_read(self, message_id: str) -> bool:

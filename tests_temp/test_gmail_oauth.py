@@ -43,7 +43,7 @@ import base64
 # SCOPES tell Google exactly what permissions we need
 # We only request what we actually use — principle of least privilege
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",  # read emails
+    "https://www.googleapis.com/auth/gmail.modify",  # read + mark as read emails
     "https://www.googleapis.com/auth/gmail.send",      # send emails
 ]
 
